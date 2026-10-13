@@ -1,6 +1,10 @@
-fastapi
-uvicorn[standard]
-gunicorn
+duckdb
 langgraph
+langchain
 langchain-google-genai
-pydantic
+fastapi
+uvicorn
+python-dotenv
+requests
+pandas
+pydantic>=2.0
