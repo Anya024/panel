@@ -3,35 +3,135 @@
 Enterprise Agentic Lakehouse Control Plane
 FastAPI Application running on Azure App Service / Local
 Provides:
-1. Autonomous Triage, Root-Cause Analysis, and Verified Self-Healing Remediation for Silver
+1. Autonomous Background Polling Loop (Async Watchdog) that checks Databricks quarantine_records continuously
 2. Live Remote Actuator: Connects to Databricks SQL Warehouse to heal tables directly via POST /remediate
 3. Executive AI Business Intelligence & Strategic Insights for Gold via POST /insights
 """
 import os
 import json
+import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 try:
     from agent.graph import healing_graph, agent_llm, _extract_text
-    from agent.tools import fetch_live_quarantined_samples, execute_live_remediation_on_databricks
+    from agent.tools import fetch_live_quarantined_samples, execute_live_remediation_on_databricks, get_databricks_connection
 except ImportError:
     from graph import healing_graph, agent_llm, _extract_text
-    from tools import fetch_live_quarantined_samples, execute_live_remediation_on_databricks
+    from tools import fetch_live_quarantined_samples, execute_live_remediation_on_databricks, get_databricks_connection
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("lakehouse-control-plane")
 
+# Background Watchdog Configuration
+POLL_INTERVAL_SECONDS = int(os.getenv("AUTONOMOUS_POLL_INTERVAL", "30"))
+watchdog_state = {
+    "is_running": False,
+    "last_check_time": None,
+    "last_remediation_time": None,
+    "total_autonomous_runs": 0,
+    "last_status": "INITIALIZING",
+    "last_error": None
+}
+
+async def autonomous_healing_watchdog():
+    """
+    Background Task: Continuously monitors Databricks quarantine_records.
+    When rows arrive, automatically triggers LangGraph diagnosis, sandbox test,
+    Delta MERGE, and audit logging with ZERO human intervention.
+    """
+    await asyncio.sleep(5)  # initial warmup
+    logger.info(f"🚀 Autonomous DataOps Watchdog Started (Polling every {POLL_INTERVAL_SECONDS}s)...")
+    watchdog_state["is_running"] = True
+
+    while True:
+        try:
+            watchdog_state["last_check_time"] = datetime.utcnow().isoformat()
+
+            # 1. Quick check: Are there rows in quarantine?
+            has_quarantine_rows = False
+            q_count = 0
+            try:
+                loop = asyncio.get_event_loop()
+                def check_count():
+                    with get_databricks_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("SELECT count(*) FROM self_healing_lakehouse.self_healing_lakehouse.quarantine_records")
+                            return cursor.fetchone()[0]
+                q_count = await loop.run_in_executor(None, check_count)
+                if q_count > 0:
+                    has_quarantine_rows = True
+            except Exception as conn_err:
+                watchdog_state["last_error"] = str(conn_err)
+                watchdog_state["last_status"] = f"DATABRICKS_CONN_WAIT: {str(conn_err)[:60]}"
+
+            # 2. If quarantine has records, autonomously execute remediation
+            if has_quarantine_rows:
+                logger.info(f"🚨 [WATCHDOG ALERT] Detected {q_count} quarantined records in Databricks! Triggering autonomous self-healing...")
+                run_id = f"watchdog-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+
+                # Fetch samples
+                samples = await loop.run_in_executor(None, fetch_live_quarantined_samples, 10)
+
+                # Run LangGraph Agent Brain
+                initial_state = {
+                    "table_name": "quarantine_records",
+                    "catalog": "self_healing_lakehouse",
+                    "schema_name": "self_healing_lakehouse",
+                    "quarantine_count": q_count,
+                    "sample_records": samples,
+                    "pipeline_run_id": run_id,
+                    "schema_metadata": {},
+                    "root_cause_analysis": "",
+                    "proposed_sql": "",
+                    "proposed_pyspark": "",
+                    "validation_passed": False,
+                    "validation_errors": [],
+                    "iteration_count": 0,
+                    "max_iterations": 3,
+                    "dry_run_metrics": {}
+                }
+
+                final_state = await loop.run_in_executor(None, healing_graph.invoke, initial_state)
+                remediation_sql = final_state.get("proposed_sql", "")
+                analysis = final_state.get("root_cause_analysis", "")
+
+                # Execute Delta MERGE on Databricks
+                result = await loop.run_in_executor(None, execute_live_remediation_on_databricks, remediation_sql, run_id, analysis)
+
+                watchdog_state["last_remediation_time"] = datetime.utcnow().isoformat()
+                watchdog_state["total_autonomous_runs"] += 1
+                watchdog_state["last_status"] = f"SUCCESSFULLY_HEALED_{result.get('healed_records_merged')}_ROWS"
+                logger.info(f"✅ [AUTONOMOUS RUN COMPLETED] Healed {result.get('healed_records_merged')} records directly in Databricks!")
+            else:
+                watchdog_state["last_status"] = "IDLE_ZERO_QUARANTINE_ROWS"
+
+        except Exception as e:
+            logger.error(f"Watchdog iteration error: {e}")
+            watchdog_state["last_error"] = str(e)
+            watchdog_state["last_status"] = f"ERROR: {str(e)[:60]}"
+
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start the autonomous background watchdog on server boot
+    task = asyncio.create_task(autonomous_healing_watchdog())
+    yield
+    task.cancel()
+
 app = FastAPI(
     title="Self-Healing Lakehouse Control Plane",
     description="Enterprise DataOps & Executive AI Analytics for Databricks Unity Catalog Lakehouses",
-    version="2.2.0"
+    version="2.3.0",
+    lifespan=lifespan
 )
 
 # --- REQUEST AND RESPONSE MODELS ---
@@ -93,15 +193,19 @@ class ExecutiveInsightsResponse(BaseModel):
 def health():
     return {
         "status": "Agentic Lakehouse Control Plane is Online on Azure",
-        "version": "2.2.0",
+        "version": "2.3.0",
+        "autonomous_mode": "ACTIVE_CONTINUOUS_WATCHDOG",
+        "poll_interval_seconds": POLL_INTERVAL_SECONDS,
+        "watchdog_telemetry": watchdog_state,
         "llm_engine": "Google Gemini (with Multi-Model Fallbacks)",
         "connected_databricks_host": os.getenv("DATABRICKS_HOST", "Configured"),
         "capabilities": [
+            "Autonomous Continuous Databricks Watchdog",
             "Unity Catalog Schema Inspection",
             "Multi-Anomaly Diagnosis ($, EUR, Sentinels, Dates)",
             "In-Memory Sandboxed Dry-Run Validation",
             "Self-Correction LangGraph Loop",
-            "Direct Remote Databricks SQL Actuator (POST /remediate)",
+            "Direct Remote Databricks SQL Actuator",
             "ACID Delta Lake MERGE Remediation",
             "Executive AI Strategic Intelligence (Gold Analytics)"
         ],
@@ -116,7 +220,6 @@ async def triage(payload: FailurePayload):
     test the fix in a sandbox dry-run, and return the validated remediation plan.
     """
     logger.info(f"Received triage request for table '{payload.table}' with {len(payload.sample_records)} sample rows.")
-
     run_id = payload.pipeline_run_id or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
 
     initial_state = {
@@ -168,17 +271,11 @@ async def triage(payload: FailurePayload):
 async def remote_actuate_remediation():
     """
     Direct Enterprise Remote Actuator:
-    1. Azure connects into Databricks SQL Warehouse directly via authenticated connector.
-    2. Fetches live quarantined records from self_healing_lakehouse.self_healing_lakehouse.quarantine_records.
-    3. LangGraph Brain diagnoses anomalies, writes remediation SQL, and validates it in sandbox.
-    4. Executes ACID Delta MERGE into silver_records_final.
-    5. Evicts healed records from quarantine_records.
-    6. Appends audit trace to audit_healing_log.
+    Triggered on-demand (or automatically by the watchdog).
     """
     logger.info("Triggering remote live self-healing actuation on Databricks...")
     run_id = f"actuate-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
 
-    # 1. Fetch live quarantined samples from Databricks
     try:
         samples = fetch_live_quarantined_samples(limit=10)
     except Exception as e:
@@ -201,7 +298,6 @@ async def remote_actuate_remediation():
             completed_at=datetime.utcnow().isoformat()
         )
 
-    # 2. Run LangGraph Healing Brain
     initial_state = {
         "table_name": "quarantine_records",
         "catalog": "self_healing_lakehouse",
@@ -238,7 +334,6 @@ async def remote_actuate_remediation():
             detail=f"Remediation could not be validated safely: {final_state.get('validation_errors')}"
         )
 
-    # 3. Actuate live on Databricks via Delta MERGE & Audit Log
     try:
         result = execute_live_remediation_on_databricks(
             remediation_sql=remediation_sql,
@@ -335,4 +430,3 @@ Return ONLY valid JSON. No markdown backticks (no ```json).
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("agent.main:app", host="0.0.0.0", port=8000, reload=True)
-
