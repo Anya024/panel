@@ -1,4 +1,6 @@
 
+
+
 """
 DataOps Execution & Inspection Tools
 Supports Schema Introspection, In-Memory Sandboxed Dry-Run Execution,
@@ -19,14 +21,16 @@ DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
 DATABRICKS_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH")
 
 def get_databricks_connection():
-    """Returns an authenticated live connection to Databricks SQL Warehouse."""
+    """Returns an authenticated live connection to Databricks SQL Warehouse with default catalog set."""
     from databricks import sql
     if not (DATABRICKS_HOST and DATABRICKS_TOKEN and DATABRICKS_HTTP_PATH):
         raise ValueError("Missing DATABRICKS_HOST, DATABRICKS_TOKEN, or DATABRICKS_HTTP_PATH environment variables.")
     return sql.connect(
         server_hostname=DATABRICKS_HOST,
         http_path=DATABRICKS_HTTP_PATH,
-        access_token=DATABRICKS_TOKEN
+        access_token=DATABRICKS_TOKEN,
+        catalog="self_healing_lakehouse",
+        schema="self_healing_lakehouse"
     )
 
 def fetch_live_quarantined_samples(limit: int = 10) -> List[Dict[str, Any]]:
@@ -104,15 +108,26 @@ def execute_live_remediation_on_databricks(remediation_sql: str, run_id: str, an
             ON target.InvoiceNo = source.InvoiceNo AND target.StockCode = source.StockCode
             WHEN MATCHED THEN
                 UPDATE SET
-                    target.UnitPrice = source.UnitPrice_Clean,
-                    target.InvoiceDate = source.Date_Clean,
+                    target.UnitPrice = CAST(source.UnitPrice_Clean AS STRING),
+                    target.InvoiceDate = CAST(source.Date_Clean AS STRING),
                     target.Quantity = source.Quantity,
                     target.Description = source.Description,
                     target.CustomerID = source.CustomerID,
-                    target.Country = source.Country
+                    target.Country = source.Country,
+                    target.UnitPrice_Clean = CAST(source.UnitPrice_Clean AS DOUBLE),
+                    target.Date_Clean = source.Date_Clean,
+                    target.Validation_Status = 'HEALED'
             WHEN NOT MATCHED THEN
-                INSERT (InvoiceNo, StockCode, Description, Quantity, InvoiceDate, UnitPrice, CustomerID, Country)
-                VALUES (source.InvoiceNo, source.StockCode, source.Description, source.Quantity, source.Date_Clean, source.UnitPrice_Clean, source.CustomerID, source.Country)
+                INSERT (
+                    InvoiceNo, StockCode, Description, Quantity, InvoiceDate, UnitPrice,
+                    CustomerID, Country, UnitPrice_Clean, Date_Clean, Validation_Status
+                )
+                VALUES (
+                    source.InvoiceNo, source.StockCode, source.Description, source.Quantity,
+                    CAST(source.Date_Clean AS STRING), CAST(source.UnitPrice_Clean AS STRING),
+                    source.CustomerID, source.Country, CAST(source.UnitPrice_Clean AS DOUBLE),
+                    source.Date_Clean, 'HEALED'
+                )
             """
             cursor.execute(merge_query)
 
@@ -257,4 +272,6 @@ def run_sandboxed_dryrun(sample_records: List[Dict[str, Any]], transformation_sq
             "error": f"SQL Execution Syntax/Logic Error: {str(e)}",
             "sample_output": None
         }
+
+
 
