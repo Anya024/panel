@@ -1,6 +1,4 @@
 
-
-
 """
 LangGraph Self-Healing State Machine with Automated Sandbox Testing and Self-Correction Loop
 Designed for Databricks Unity Catalog Lakehouses
@@ -12,7 +10,10 @@ from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 
-from agent.tools import inspect_lakehouse_schema, run_sandboxed_dryrun
+try:
+    from agent.tools import inspect_lakehouse_schema, run_sandboxed_dryrun
+except ImportError:
+    from tools import inspect_lakehouse_schema, run_sandboxed_dryrun
 
 load_dotenv()
 
@@ -108,10 +109,11 @@ def remediation_generator_node(state: LakehouseState) -> Dict[str, Any]:
 CRITICAL: Your previous remediation attempt failed sandboxed dry-run execution:
 Errors encountered: {json.dumps(state['validation_errors'])}
 Please fix the logic, handle all edge cases, and eliminate these errors.
+Note for date parsing: Use STRPTIME(SPLIT(TRIM(InvoiceDate), ' ')[0], '%m/%d/%Y') or SUBSTR/SPLIT operations. Do NOT use to_date() as it is not supported in the sandbox parser.
 """
 
     prompt = f"""
-You are an expert Data Engineer writing ANSI SQL and Spark SQL for Databricks Delta Lakehouse.
+You are an expert Data Engineer writing SQL for Databricks Delta Lakehouse and ANSI SQL sandboxes.
 
 Root Cause Diagnosis:
 {state['root_cause_analysis']}
@@ -130,23 +132,34 @@ REQUIREMENTS:
 1. SELECT from `quarantine_records`.
 2. UnitPrice Healing:
    - Strip '$', ' EUR', 'EUR', and commas.
-   - If UnitPrice contains 'PRICE_NOT_FOUND' or cannot be parsed, default to 0.00 (or handle gracefully via TRY_CAST / COALESCE).
+   - If UnitPrice contains 'PRICE_NOT_FOUND' or cannot be parsed, default to 0.00.
    - Alias as `UnitPrice_Clean` (DECIMAL(18,2) or DOUBLE).
 3. InvoiceDate Healing:
    - Handle 'M/d/yyyy' and 'MM/dd/yyyy' as well as standard dates.
-   - Alias as `Date_Clean` (DATE).
+   - For parsing, use:
+     COALESCE(TRY_CAST(InvoiceDate AS DATE), TRY_CAST(STRPTIME(SPLIT(TRIM(InvoiceDate), ' ')[0], '%m/%d/%Y') AS DATE)) as Date_Clean
+   - Do NOT use the to_date() scalar function because it causes errors in the sandbox validator.
 4. Preserve all essential columns: InvoiceNo, StockCode, Description, Quantity, Date_Clean, UnitPrice_Clean, CustomerID, Country.
-5. WHERE filter: Only include salvageable records where CustomerID IS NOT NULL and CustomerID != ''.
+5. WHERE filter: Only include salvageable records where CustomerID IS NOT NULL AND TRIM(CustomerID) != ''.
 6. Return ONLY valid SQL query text. No markdown backticks (no ```sql), no commentary, no explanation.
 
-Example template:
+Example pattern:
 SELECT
     InvoiceNo,
     StockCode,
     Description,
     CAST(Quantity AS INT) as Quantity,
-    COALESCE(TRY_CAST(InvoiceDate AS DATE), TRY_CAST(STRPTIME(InvoiceDate, '%m/%d/%Y') AS DATE)) as Date_Clean,
-    TRY_CAST(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(CAST(UnitPrice AS VARCHAR), '[$]| EUR|EUR|,', ''), 'PRICE_NOT_FOUND', '0.00'), ' ', '') AS DECIMAL(18,2)) as UnitPrice_Clean,
+    COALESCE(
+        TRY_CAST(InvoiceDate AS DATE),
+        TRY_CAST(STRPTIME(SPLIT(TRIM(InvoiceDate), ' ')[0], '%m/%d/%Y') AS DATE),
+        TRY_CAST(SUBSTR(InvoiceDate, 7, 4) || '-' || LPAD(SPLIT(InvoiceDate, '/')[0], 2, '0') || '-' || LPAD(SPLIT(InvoiceDate, '/')[1], 2, '0') AS DATE)
+    ) as Date_Clean,
+    TRY_CAST(
+        CASE
+            WHEN UPPER(CAST(UnitPrice AS STRING)) LIKE '%PRICE_NOT_FOUND%' THEN '0.00'
+            ELSE REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(CAST(UnitPrice AS STRING), '[$]', ''), ' EUR|EUR', ''), ',', '')
+        END AS DECIMAL(18,2)
+    ) as UnitPrice_Clean,
     CustomerID,
     Country
 FROM quarantine_records
@@ -217,12 +230,12 @@ def should_continue(state: LakehouseState) -> str:
     if state["iteration_count"] >= state.get("max_iterations", 3):
         print(f"⚠️ Reached max iterations ({state['max_iterations']}). Escalating to human review.")
         return "escalate"
-    print(" Looping back to Generator for self-correction...")
+    print("🔄 Looping back to Generator for self-correction...")
     return "retry"
 
 # --- NODE 5: ESCALATION NODE ---
 def escalation_node(state: LakehouseState) -> Dict[str, Any]:
-    print(" Node 5: Remediation requires human intervention. Escalating...")
+    print("🚨 Node 5: Remediation requires human intervention. Escalating...")
     return {
         "proposed_sql": "-- ESCALATED: Automated remediation could not be safely verified. Quarantined records remain in DLQ.",
         "dry_run_metrics": {"status": "ESCALATED_TO_HUMAN"}
@@ -254,6 +267,4 @@ workflow.add_conditional_edges(
 workflow.add_edge("escalation", END)
 
 healing_graph = workflow.compile()
-
-
 
